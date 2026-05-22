@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bumble-bleak"
+version = "0.1.0"
+description = "A bleak-compatible BLE central API for Linux, backed by Bumble (no BlueZ/D-Bus, no kernel BT stack)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Fabian" }]
+dependencies = ["bumble>=0.0.200"]
+
+[project.urls]
+Homepage = "https://github.com/fl4p/bumble-bleak"
+
+[tool.setuptools.packages.find]
+include = ["bumble_bleak*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
