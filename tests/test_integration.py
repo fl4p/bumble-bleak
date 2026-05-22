@@ -148,6 +148,14 @@ async def test_scanner_discovers_advertiser(server_and_client):
     addresses = [d.address for d in scanner.discovered_devices]
     assert server.random_address.to_string(False) in addresses
 
+    # bleak-compatible shape: {address: (BLEDevice, AdvertisementData)}
+    daad = scanner.discovered_devices_and_advertisement_data
+    addr = server.random_address.to_string(False)
+    assert addr in daad
+    dev, adv = daad[addr]  # values are (device, advertisement) tuples
+    assert dev.address == addr
+    assert hasattr(adv, "rssi")
+
 
 async def test_pairing_just_works(server_and_client):
     from bumble.pairing import PairingConfig, PairingDelegate

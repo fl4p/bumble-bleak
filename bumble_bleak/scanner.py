@@ -72,5 +72,6 @@ class BleakScanner:
         return [device for device, _ in self._found.values()]
 
     @property
-    def discovered_devices_and_advertisement_data(self) -> Dict[BLEDevice, AdvertisementData]:
-        return {device: adv for device, adv in self._found.values()}
+    def discovered_devices_and_advertisement_data(self) -> Dict[str, Tuple[BLEDevice, AdvertisementData]]:
+        # Matches bleak: keyed by address, values are (device, advertisement) tuples.
+        return dict(self._found)
