@@ -9,39 +9,72 @@ counted across the facade objects that use it.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import re
 import socket
+import struct
 import sys
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from .exc import BleakError
 
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 _BT_SYSFS = "/sys/class/bluetooth"
+_HCIGETDEVINFO = 0x800448D3  # _IOR('H', 211, int)
+
+
+def _hci_addr_for_index(dev_id: int) -> Optional[str]:
+    """Return the lowercase MAC of controller ``dev_id`` via the HCIGETDEVINFO
+    ioctl, or None if it doesn't exist / can't be queried.
+
+    Uses the ioctl rather than sysfs because ``/sys/class/bluetooth/hciN/address``
+    isn't present on all kernels. Needs CAP_NET_RAW to open the HCI socket.
+    """
+    _ensure_bluetooth_socket_constants()
+    try:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+    except OSError:
+        return None
+    try:
+        buf = bytearray(96)  # struct hci_dev_info (~90 bytes); we read bdaddr@10
+        struct.pack_into("H", buf, 0, dev_id)
+        try:
+            fcntl.ioctl(sock.fileno(), _HCIGETDEVINFO, buf)
+        except OSError:
+            return None
+        return ":".join("%02X" % b for b in reversed(buf[10:16])).lower()
+    finally:
+        sock.close()
+
+
+def _candidate_hci_indices() -> List[int]:
+    """Controller indices to probe: those listed in sysfs (handles re-enumerated
+    high indices) plus a small fallback range."""
+    indices = set(range(8))
+    try:
+        for name in os.listdir(_BT_SYSFS):
+            if name.startswith("hci") and ":" not in name:  # skip connection nodes
+                try:
+                    indices.add(int(name[3:]))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return sorted(indices)
 
 
 def _hci_index_for_mac(mac: str) -> Optional[int]:
     """Resolve a controller MAC (e.g. ``2C:CF:67:5F:4A:6D``) to its current hci
-    index by reading ``/sys/class/bluetooth/hciN/address``.
+    index.
 
     The kernel hci index can change across USB re-enumeration; selecting by MAC
     re-resolves it on every acquire so config survives the index moving.
     """
     target = mac.lower()
-    try:
-        names = os.listdir(_BT_SYSFS)
-    except OSError:
-        return None
-    for name in sorted(names):
-        if not name.startswith("hci"):
-            continue
-        try:
-            with open(os.path.join(_BT_SYSFS, name, "address")) as f:
-                if f.read().strip().lower() == target:
-                    return int(name[3:])
-        except (OSError, ValueError):
-            continue
+    for dev_id in _candidate_hci_indices():
+        if _hci_addr_for_index(dev_id) == target:
+            return dev_id
     return None
 
 
@@ -119,8 +152,6 @@ def _bring_adapter_down(index: int) -> None:
         return
     if os.environ.get("BUMBLE_BLEAK_NO_ADAPTER_DOWN"):
         return
-    import fcntl
-
     HCIDEVDOWN = 0x400448CA  # _IOW('H', 202, int)
     try:
         sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
