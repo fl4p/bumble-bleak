@@ -10,9 +10,39 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import socket
 import sys
 from typing import Callable, Dict, Optional
+
+from .exc import BleakError
+
+_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+_BT_SYSFS = "/sys/class/bluetooth"
+
+
+def _hci_index_for_mac(mac: str) -> Optional[int]:
+    """Resolve a controller MAC (e.g. ``2C:CF:67:5F:4A:6D``) to its current hci
+    index by reading ``/sys/class/bluetooth/hciN/address``.
+
+    The kernel hci index can change across USB re-enumeration; selecting by MAC
+    re-resolves it on every acquire so config survives the index moving.
+    """
+    target = mac.lower()
+    try:
+        names = os.listdir(_BT_SYSFS)
+    except OSError:
+        return None
+    for name in sorted(names):
+        if not name.startswith("hci"):
+            continue
+        try:
+            with open(os.path.join(_BT_SYSFS, name, "address")) as f:
+                if f.read().strip().lower() == target:
+                    return int(name[3:])
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _ensure_bluetooth_socket_constants() -> None:
@@ -44,12 +74,21 @@ def _transport_spec(adapter: Optional[str]) -> str:
     """Map a bleak-style adapter name to a Bumble transport spec.
 
     * ``None``        -> ``$BUMBLE_BLEAK_TRANSPORT`` or ``hci-socket:0``
+    * a controller MAC (``2C:CF:67:5F:4A:6D``) -> resolved to its current
+      ``hci-socket:N`` via sysfs (robust to the index changing)
     * ``hci0``/``hciN`` -> ``hci-socket:N``
-    * anything containing ``:`` is treated as a literal Bumble transport spec
-      (handy for tests, e.g. ``android-netsim`` or a virtual link).
+    * anything else containing ``:`` is treated as a literal Bumble transport
+      spec (handy for tests, e.g. ``android-netsim`` or a virtual link).
     """
     if adapter is None:
         return os.environ.get("BUMBLE_BLEAK_TRANSPORT", "hci-socket:0")
+    if _MAC_RE.match(adapter):
+        index = _hci_index_for_mac(adapter)
+        if index is None:
+            raise BleakError(
+                f"No Bluetooth adapter with address {adapter} found in {_BT_SYSFS}"
+            )
+        return f"hci-socket:{index}"
     if ":" in adapter:
         return adapter
     if adapter.startswith("hci"):

@@ -49,6 +49,25 @@ def test_advertisement_data_parsing():
     assert "0000ffe0-0000-1000-8000-00805f9b34fb" in parsed.service_uuids
 
 
+def test_transport_spec_mac_resolution(tmp_path, monkeypatch):
+    import pytest
+
+    from bumble_bleak import _backend
+
+    for name, mac in [("hci0", "0C:EF:15:47:4A:46"), ("hci1", "2C:CF:67:5F:4A:6D")]:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "address").write_text(mac + "\n")
+    monkeypatch.setattr(_backend, "_BT_SYSFS", str(tmp_path))
+
+    assert _backend._transport_spec("2C:CF:67:5F:4A:6D") == "hci-socket:1"
+    assert _backend._transport_spec("0c:ef:15:47:4a:46") == "hci-socket:0"  # case-insensitive
+    assert _backend._transport_spec("hci1") == "hci-socket:1"
+    assert _backend._transport_spec(None) == "hci-socket:0"
+    with pytest.raises(_backend.BleakError):
+        _backend._transport_spec("AA:BB:CC:DD:EE:FF")
+
+
 def test_exceptions_are_bleak_errors():
     assert issubclass(bleak.BleakDeviceNotFoundError, bleak.BleakError)
     assert issubclass(bleak.BleakCharacteristicNotFoundError, bleak.BleakError)

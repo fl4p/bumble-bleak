@@ -42,8 +42,15 @@ from bumble_bleak import BleakClient, BleakScanner
 ```
 
 Adapter naming: `None` → `hci-socket:0` (override with `$BUMBLE_BLEAK_TRANSPORT`),
-`"hci0"`/`"hciN"` → `hci-socket:N`, any string with `:` is used as a literal
-Bumble transport spec.
+`"hci0"`/`"hciN"` → `hci-socket:N`, a controller **MAC** (`"2C:CF:67:5F:4A:6D"`)
+→ resolved to its current `hciN` at connect time, any other string with `:` is a
+literal Bumble transport spec.
+
+bumble-bleak takes the adapter **exclusively** (brings it down for an HCI User
+Channel), so dedicate one adapter to it and leave another to BlueZ/HA. On USB
+dongles the index can change after the User Channel closes — see
+[docs/adapters-and-reenumeration.md](docs/adapters-and-reenumeration.md) (prefer a
+UART adapter, or select by MAC).
 
 ### Run requirements (Linux)
 
