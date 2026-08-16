@@ -28,9 +28,11 @@ class BleakClient:
     ):
         if isinstance(address_or_device, BLEDevice):
             self.address = address_or_device.address
+            self._name = address_or_device.name
             self._peer_address = address_or_device._bumble_address
         else:
             self.address = address_or_device
+            self._name = None
             self._peer_address = None
 
         self._adapter = adapter
@@ -48,6 +50,10 @@ class BleakClient:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
 
     def _candidate_addresses(self):
         if self._peer_address is not None:
