@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -122,7 +124,19 @@ class BleakScanner:
 
         self._found[address] = (device, adv_data)
         if self._detection_callback is not None:
-            self._detection_callback(device, adv_data)
+            result = self._detection_callback(device, adv_data)
+            if inspect.iscoroutine(result):
+                # bleak allows async detection callbacks; schedule the coroutine
+                # on the running loop so it is actually awaited.
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(result)
+                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(result)
+                    else:
+                        asyncio.run(result)
 
     @property
     def discovered_devices(self) -> List[BLEDevice]:
