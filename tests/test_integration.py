@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 from bumble.controller import Controller
-from bumble.device import Device
+from bumble.device import Device, Peer
 from bumble.gatt import (
     Characteristic,
     CharacteristicValue,
@@ -132,6 +132,62 @@ async def test_connect_discover_read_write_notify(server_and_client):
     await client.stop_notify(NOTIFY_UUID)
     await client.disconnect()
     assert not client.is_connected
+
+
+def _client_for(server):
+    server_address = server.random_address
+    dev = bleak.BLEDevice(
+        address=server_address.to_string(False),
+        name="server",
+        _bumble_address=server_address,
+    )
+    return bleak.BleakClient(dev, adapter="test")
+
+
+async def test_connect_negotiates_mtu(server_and_client):
+    """Without an ATT MTU exchange every payload is capped at 20 bytes, which
+    silently truncates peripherals that size their records to the negotiated MTU.
+    """
+    server, _written, notify_char = server_and_client
+
+    client = _client_for(server)
+    assert client.mtu_size == 23  # nothing negotiated yet
+
+    await client.connect(timeout=5)
+    try:
+        assert client.mtu_size == 517
+
+        # The point of the exchange: a record larger than the 20-byte default
+        # payload has to survive intact.
+        received = []
+        await client.start_notify(NOTIFY_UUID, lambda s, d: received.append(bytes(d)))
+        await asyncio.sleep(0.05)
+        payload = bytes(range(64))
+        await server.notify_subscribers(notify_char, payload)
+        await asyncio.sleep(0.1)
+        assert received and received[-1] == payload
+    finally:
+        await client.disconnect()
+
+
+async def test_connect_survives_failed_mtu_exchange(server_and_client, monkeypatch):
+    """A peer that refuses the exchange must still yield a usable link."""
+    server, _written, _notify = server_and_client
+
+    async def boom(self, mtu):
+        raise RuntimeError("peer refused")
+
+    monkeypatch.setattr(Peer, "request_mtu", boom)
+
+    client = _client_for(server)
+    await client.connect(timeout=5)
+    try:
+        assert client.is_connected
+        assert client.mtu_size >= 23
+        value = await client.read_gatt_char(bleak.uuids.normalize_uuid_str(READ_UUID))
+        assert bytes(value) == bytes([0xAB, 0xCD])
+    finally:
+        await client.disconnect()
 
 
 async def test_scanner_discovers_advertiser(server_and_client):

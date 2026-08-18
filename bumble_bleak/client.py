@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Callable, Optional, Union
 
+from bumble.att import ATT_DEFAULT_MTU
 from bumble.device import Peer
 from bumble.hci import Address, AddressType
 
@@ -14,7 +16,21 @@ from .device import BLEDevice
 from .exc import BleakCharacteristicNotFoundError, BleakError
 from .uuids import normalize_uuid_str
 
+logger = logging.getLogger(__name__)
+
 CharSpec = Union[str, int, BleakGATTCharacteristic]
+
+# BlueZ negotiates an ATT MTU on its own, so bleak callers never see the 23-byte
+# default. Bumble does not: without an explicit exchange every payload is capped
+# at ATT_DEFAULT_MTU-3 = 20 bytes, which silently truncates peripherals that size
+# their records to the negotiated MTU. 517 is the largest LE ATT MTU; the peer
+# caps it to whatever it supports.
+REQUESTED_MTU = 517
+
+# The GATT request timeout is 30s and independent of connect(timeout=...). The MTU
+# exchange is now the first PDU on the link, so an unresponsive peer would stall
+# every connect for that long; cap it well below.
+MTU_EXCHANGE_TIMEOUT = 5.0
 
 
 class BleakClient:
@@ -44,6 +60,7 @@ class BleakClient:
         self._peer: Optional[Peer] = None
         self._services = BleakGATTServiceCollection([])
         self._connected = False
+        self._mtu: Optional[int] = None
         self._subscriptions = {}  # char handle -> bumble subscriber callable
 
     # -- connection lifecycle ---------------------------------------------
@@ -54,6 +71,17 @@ class BleakClient:
     @property
     def name(self) -> Optional[str]:
         return self._name
+
+    @property
+    def mtu_size(self) -> int:
+        """Negotiated ATT MTU (bleak API parity).
+
+        Like bleak's BlueZ backend, this reports the default MTU rather than
+        raising when the value is unknown.
+        """
+        if self._mtu is not None:
+            return self._mtu
+        return ATT_DEFAULT_MTU
 
     def _candidate_addresses(self):
         if self._peer_address is not None:
@@ -105,6 +133,9 @@ class BleakClient:
     def _on_disconnection(self, _reason) -> None:
         was_connected = self._connected
         self._connected = False
+        # _teardown() is not on this path, so anything a caller can still read
+        # has to be invalidated here or it reports the dead link's values.
+        self._mtu = None
         if was_connected and self._disconnected_callback is not None:
             self._disconnected_callback(self)
 
@@ -112,6 +143,7 @@ class BleakClient:
         self._connected = False
         self._connection = None
         self._peer = None
+        self._mtu = None
         self._subscriptions.clear()
         self._services = BleakGATTServiceCollection([])
         if self._backend is not None:
@@ -128,6 +160,21 @@ class BleakClient:
     # -- GATT services -----------------------------------------------------
     async def _discover_services(self) -> None:
         self._peer = Peer(self._connection)
+        # Before discovery, so the larger MTU applies to discovery reads too.
+        try:
+            self._mtu = await asyncio.wait_for(
+                self._peer.request_mtu(REQUESTED_MTU), MTU_EXCHANGE_TIMEOUT
+            )
+        except Exception as exc:
+            # A peer may reject the exchange, or have initiated one itself; the
+            # link still works, so this is not fatal. Read the bearer rather than
+            # assuming the default: the exchange may have completed on the wire
+            # even though the call did not return it, and under-reporting here
+            # would make callers size their writes down.
+            self._mtu = self._peer.gatt_client.mtu
+            logger.debug(
+                "ATT MTU exchange failed (%s); continuing at MTU %d", exc, self._mtu
+            )
         await self._peer.discover_services()
         for service in self._peer.services:
             await service.discover_characteristics()
