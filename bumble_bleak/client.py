@@ -60,6 +60,7 @@ class BleakClient:
         self._peer: Optional[Peer] = None
         self._services = BleakGATTServiceCollection([])
         self._connected = False
+        self._disconnect_reason = None
         self._mtu: Optional[int] = None
         self._subscriptions = {}  # char handle -> bumble subscriber callable
 
@@ -93,16 +94,24 @@ class BleakClient:
         ]
 
     async def connect(self, timeout: float = 10.0, **kwargs) -> bool:
+        self._disconnect_reason = None
         self._backend = await _backend.get_backend(self._adapter)
         device = await self._backend.acquire()
+        deadline = asyncio.get_running_loop().time() + timeout
         try:
             last_exc = None
-            for peer_address in self._candidate_addresses():
+            candidates = self._candidate_addresses()
+            for index, peer_address in enumerate(candidates):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    last_exc = asyncio.TimeoutError()
+                    break
+                attempt_timeout = remaining / (len(candidates) - index)
                 try:
                     self._connection = await device.connect(
                         peer_address,
                         own_address_type=_backend.OWN_ADDRESS_TYPE,
-                        timeout=timeout,
+                        timeout=attempt_timeout,
                     )
                     break
                 except Exception as e:  # noqa: BLE001 - try next address type
@@ -115,24 +124,32 @@ class BleakClient:
             await self._discover_services()
             return True
         except BaseException:
-            await self._backend.release()
-            self._backend = None
-            self._connection = None
-            self._connected = False
+            await self._cleanup_failed_connect()
             raise
 
-    async def disconnect(self) -> bool:
-        if self._connection is not None:
+    async def _cleanup_failed_connect(self) -> None:
+        if self._connection is not None and self._connected:
             try:
                 await self._connection.disconnect()
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 pass
         await self._teardown()
+
+    async def disconnect(self) -> bool:
+        try:
+            if self._connection is not None and self._connected:
+                try:
+                    await self._connection.disconnect()
+                except Exception:
+                    pass
+        finally:
+            await self._teardown()
         return True
 
-    def _on_disconnection(self, _reason) -> None:
+    def _on_disconnection(self, reason) -> None:
         was_connected = self._connected
         self._connected = False
+        self._disconnect_reason = reason
         # _teardown() is not on this path, so anything a caller can still read
         # has to be invalidated here or it reports the dead link's values.
         self._mtu = None
@@ -150,6 +167,40 @@ class BleakClient:
             await self._backend.release()
             self._backend = None
 
+    async def _translate_gatt_cancellation(self, awaitable, operation: str):
+        try:
+            return await awaitable
+        except asyncio.CancelledError as exc:
+            if self._connected:
+                raise
+            detail = (
+                f" (reason={self._disconnect_reason})"
+                if self._disconnect_reason is not None
+                else ""
+            )
+            raise BleakError(
+                f"{operation} failed: disconnected from {self.address}{detail}"
+            ) from exc
+
+    async def _await_gatt(self, awaitable, operation: str):
+        operation_task = asyncio.ensure_future(
+            self._translate_gatt_cancellation(awaitable, operation)
+        )
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            # Only parent cancellation reaches this layer: disconnect-caused ATT
+            # cancellation is translated inside operation_task. This remains
+            # unambiguous when both happen in one loop turn and on Python 3.9,
+            # which has no Task.cancelling().
+            if not operation_task.done():
+                operation_task.cancel()
+            try:
+                await operation_task
+            except (Exception, asyncio.CancelledError):
+                pass
+            raise
+
     async def __aenter__(self):
         await self.connect()
         return self
@@ -159,11 +210,15 @@ class BleakClient:
 
     # -- GATT services -----------------------------------------------------
     async def _discover_services(self) -> None:
-        self._peer = Peer(self._connection)
+        await self._await_gatt(self._discover_services_impl(), "service discovery")
+
+    async def _discover_services_impl(self) -> None:
+        peer = Peer(self._connection)
+        self._peer = peer
         # Before discovery, so the larger MTU applies to discovery reads too.
         try:
             self._mtu = await asyncio.wait_for(
-                self._peer.request_mtu(REQUESTED_MTU), MTU_EXCHANGE_TIMEOUT
+                peer.request_mtu(REQUESTED_MTU), MTU_EXCHANGE_TIMEOUT
             )
         except Exception as exc:
             # A peer may reject the exchange, or have initiated one itself; the
@@ -171,17 +226,17 @@ class BleakClient:
             # assuming the default: the exchange may have completed on the wire
             # even though the call did not return it, and under-reporting here
             # would make callers size their writes down.
-            self._mtu = self._peer.gatt_client.mtu
+            self._mtu = getattr(peer.gatt_client, "mtu", ATT_DEFAULT_MTU)
             logger.debug(
                 "ATT MTU exchange failed (%s); continuing at MTU %d", exc, self._mtu
             )
-        await self._peer.discover_services()
-        for service in self._peer.services:
+        await peer.discover_services()
+        for service in peer.services:
             await service.discover_characteristics()
             for characteristic in service.characteristics:
                 await characteristic.discover_descriptors()
         self._services = BleakGATTServiceCollection(
-            [BleakGATTService(s) for s in self._peer.services]
+            [BleakGATTService(s) for s in peer.services]
         )
 
     @property
@@ -207,16 +262,23 @@ class BleakClient:
 
     async def read_gatt_char(self, char_specifier: CharSpec) -> bytearray:
         char = self._resolve_char(char_specifier)
-        return bytearray(await char.obj.read_value())
+        return bytearray(
+            await self._await_gatt(char.obj.read_value(), "characteristic read")
+        )
 
     async def write_gatt_char(self, char_specifier: CharSpec, data, response: bool = False) -> None:
         char = self._resolve_char(char_specifier)
-        await char.obj.write_value(bytes(data), with_response=response)
+        await self._await_gatt(
+            char.obj.write_value(bytes(data), with_response=response),
+            "characteristic write",
+        )
 
     async def read_gatt_descriptor(self, handle: int) -> bytearray:
         if self._peer is None:
             raise BleakError("Service discovery has not been performed yet")
-        return bytearray(await self._peer.read_value(handle))
+        return bytearray(
+            await self._await_gatt(self._peer.read_value(handle), "descriptor read")
+        )
 
     async def start_notify(
         self, char_specifier: CharSpec, callback: Callable, **kwargs
@@ -226,13 +288,17 @@ class BleakClient:
         def subscriber(data, _char=char):
             callback(_char, bytearray(data))
 
-        await char.obj.subscribe(subscriber)
+        await self._await_gatt(
+            char.obj.subscribe(subscriber), "notification subscription"
+        )
         self._subscriptions[char.handle] = subscriber
 
     async def stop_notify(self, char_specifier: CharSpec) -> None:
         char = self._resolve_char(char_specifier)
         subscriber = self._subscriptions.pop(char.handle, None)
-        await char.obj.unsubscribe(subscriber)
+        await self._await_gatt(
+            char.obj.unsubscribe(subscriber), "notification unsubscription"
+        )
 
     # -- pairing (SMP) -----------------------------------------------------
     async def pair(self, callback: Optional[Callable] = None, **kwargs) -> bool:

@@ -190,6 +190,134 @@ async def test_connect_survives_failed_mtu_exchange(server_and_client, monkeypat
         await client.disconnect()
 
 
+async def test_direct_address_connect_timeout_is_total(server_and_client, monkeypatch):
+    _server, _written, _notify = server_and_client
+    device = _backend._TEST_DEVICES["test"]
+    timeouts = []
+
+    async def fail_connect(*_args, timeout, **_kwargs):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            await asyncio.sleep(0.08)
+        raise RuntimeError("unreachable")
+
+    monkeypatch.setattr(device, "connect", fail_connect)
+
+    client = BleakClient(SERVER_ADDR, adapter="test")
+    with pytest.raises(bleak.BleakError):
+        await client.connect(timeout=0.12)
+
+    assert len(timeouts) == 2
+    assert timeouts[0] == pytest.approx(0.06, abs=0.015)
+    assert 0 < timeouts[1] < 0.06
+    assert _backend._backends["test"]._users == 0
+
+
+async def test_disconnect_during_service_discovery_is_bleak_error(
+    server_and_client, monkeypatch
+):
+    server, _written, _notify = server_and_client
+    client = _client_for(server)
+
+    async def disconnect_during_discovery(peer):
+        await peer.connection.disconnect()
+        cancelled = asyncio.get_running_loop().create_future()
+        cancelled.cancel()
+        await cancelled
+
+    monkeypatch.setattr(Peer, "discover_services", disconnect_during_discovery)
+
+    with pytest.raises(bleak.BleakError, match="service discovery.*disconnected"):
+        await client.connect(timeout=5)
+    await asyncio.sleep(0.05)
+    assert not client.is_connected
+    assert not server.connections
+    assert _backend._backends["test"]._users == 0
+
+
+async def test_cancelling_connect_disconnects_physical_link(
+    server_and_client, monkeypatch
+):
+    server, _written, _notify = server_and_client
+    client = _client_for(server)
+    discovery_started = asyncio.Event()
+
+    async def blocked_discovery(_peer):
+        discovery_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(Peer, "discover_services", blocked_discovery)
+
+    task = asyncio.create_task(client.connect(timeout=5))
+    await asyncio.wait_for(discovery_started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert not client.is_connected
+    assert not server.connections
+    assert _backend._backends["test"]._users == 0
+
+
+async def test_caller_cancellation_wins_after_disconnect(
+    server_and_client, monkeypatch
+):
+    server, _written, _notify = server_and_client
+    client = _client_for(server)
+    discovery_started = asyncio.Event()
+    pending_att = asyncio.get_running_loop().create_future()
+
+    async def blocked_discovery(_peer):
+        discovery_started.set()
+        await pending_att
+
+    monkeypatch.setattr(Peer, "discover_services", blocked_discovery)
+
+    task = asyncio.create_task(client.connect(timeout=5))
+    await asyncio.wait_for(discovery_started.wait(), timeout=5)
+    connection = next(iter(server.connections.values()))
+    await connection.disconnect()
+    await asyncio.sleep(0.05)
+    assert not client.is_connected
+
+    # Bumble cancels the pending ATT future as the caller cancels its operation.
+    # Caller cancellation must win even when both happen in one event-loop turn.
+    pending_att.cancel()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not server.connections
+    assert _backend._backends["test"]._users == 0
+
+
+async def test_disconnect_during_notify_is_bleak_error(server_and_client, monkeypatch):
+    server, _written, _notify = server_and_client
+    client = _client_for(server)
+    await client.connect(timeout=5)
+
+    char = client.services.get_characteristic(
+        bleak.uuids.normalize_uuid_str(NOTIFY_UUID)
+    )
+
+    async def disconnect_during_subscribe(_subscriber):
+        connection = next(iter(server.connections.values()))
+        await connection.disconnect()
+        await asyncio.sleep(0.05)
+        cancelled = asyncio.get_running_loop().create_future()
+        cancelled.cancel()
+        await cancelled
+
+    monkeypatch.setattr(char.obj, "subscribe", disconnect_during_subscribe)
+
+    with pytest.raises(bleak.BleakError, match="notification subscription.*disconnected"):
+        await client.start_notify(char, lambda _sender, _data: None)
+    assert not client.is_connected
+    await client.disconnect()
+    assert _backend._backends["test"]._users == 0
+
+
 async def test_scanner_discovers_advertiser(server_and_client):
     server, _written, _notify = server_and_client
 
