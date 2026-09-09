@@ -1,6 +1,11 @@
 """Minimal `bleak_retry_connector` shim backed by bumble_bleak.
 
-Only the surface aiobmsble uses: ``BLEAK_TIMEOUT`` and ``establish_connection``.
+Covers the surface aiobmsble imports: ``BLEAK_TIMEOUT``,
+``MAX_CONNECT_ATTEMPTS``, ``establish_connection`` and
+``close_stale_connections`` (aiobmsble>=0.25 imports all four; a missing symbol
+here surfaces as a cryptic ``ImportError: cannot import name
+'MAX_CONNECT_ATTEMPTS'`` that makes every aiobmsble BMS look like an "Unknown
+device type" -- see batmon-ha #385, #407).
 """
 
 from __future__ import annotations
@@ -12,13 +17,36 @@ from bumble_bleak import BLEDevice, BleakClient
 
 BLEAK_TIMEOUT: float = 20.0
 
+# Default connection attempts. aiobmsble uses this to size its hard connect
+# timeout (``MAX_CONNECT_ATTEMPTS * BLEAK_TIMEOUT + 1``); keep it in step with
+# ``establish_connection``'s ``max_attempts`` default below.
+MAX_CONNECT_ATTEMPTS: int = 4
+
+
+class BleakNotFoundError(Exception):
+    """Compatibility alias used by some callers (e.g. batmon-ha)."""
+
+
+async def close_stale_connections(
+    device: BLEDevice, only_other_adapters: bool = False, **kwargs: Any
+) -> None:
+    """No-op: there is no shared connection state to clean up.
+
+    Real ``bleak_retry_connector`` drops stale BlueZ *D-Bus* connections that a
+    crashed client left behind, because bluetoothd keeps them alive beyond the
+    process that opened them. bumble-bleak owns its controller exclusively via
+    an HCI User Channel, so every link it holds dies with this process and no
+    other host stack can be holding one on this adapter. Nothing to close.
+    """
+    return None
+
 
 async def establish_connection(
     client_class: type,
     device: BLEDevice,
     name: str,
     disconnected_callback: Optional[Callable[[Any], None]] = None,
-    max_attempts: int = 4,
+    max_attempts: int = MAX_CONNECT_ATTEMPTS,
     **kwargs: Any,
 ) -> BleakClient:
     """Create a client of ``client_class`` for ``device`` and connect, with retries.

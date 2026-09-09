@@ -27,3 +27,21 @@ def test_shadow_redirects_bleak():
     assert bu.normalize_uuid_str("ffe0") == "0000ffe0-0000-1000-8000-00805f9b34fb"
     assert brc.BLEAK_TIMEOUT == 20.0
     assert callable(brc.establish_connection)
+
+
+def test_shadow_covers_aiobmsble_retry_connector_surface():
+    """aiobmsble's basebms imports all four of these at module level.
+
+    A missing one is an ImportError at plugin import time, which batmon-ha
+    reports as "Unknown device type" (#385, #407) -- so pin the surface here.
+    """
+    import bumble_bleak.shadow  # noqa: F401  (activates on import)
+
+    from bleak_retry_connector import (  # noqa: F401
+        BLEAK_TIMEOUT,
+        MAX_CONNECT_ATTEMPTS,
+        close_stale_connections,
+        establish_connection,
+    )
+
+    assert MAX_CONNECT_ATTEMPTS >= 1
